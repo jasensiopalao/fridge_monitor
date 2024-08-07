@@ -7,7 +7,7 @@
 DHTesp dht; //Define the DHT object
 
 // sudo chmod a+rw /dev/ttyUSB0
-IPAddress apIP(192, 168, 1, 1);
+IPAddress apIP(192, 168, 2, 1);
 IPAddress netMsk(255, 255, 255, 0);
   
 
@@ -36,8 +36,19 @@ int buttonState = 0;
 unsigned long previousMillis = 0;
 const long interval = 1000; // Blink interval in milliseconds
 
+enum FridgeDoorState
+{
+  FRIDGE_DOOR_UNKNOWN_STATE,
+  FRIDGE_DOOR_RECENTLY_OPENED,
+  FRIDGE_DOOR_LONG_AGO_OPENED,
+  FRIDGE_DOOR_RECENTLY_CLOSED,
+  FRIDGE_DOOR_LONG_AGO_CLOSED
+};
+
 enum WiFiSetupState
 {
+  INIT,
+  DISCONNECT,
   CHECK_SSID,
   INVALID_CONFIG,
   CONNECT_WIFI,
@@ -45,25 +56,27 @@ enum WiFiSetupState
   CONNECTED
 };
 
-WiFiSetupState wifiSetupState = CHECK_SSID;
+WiFiSetupState wifiSetupState = INIT;
 bool late_setup_done = false;
 
 struct GlobalState {
+  bool wifi_configured = false;
   int light = 0;
   float temperature = 0.0f;
   float humidity = 0.0f;
   char info[120] = "";
+  FridgeDoorState fridge_door = FRIDGE_DOOR_UNKNOWN_STATE;
 } global_state;
 
 void printLEDState(bool state)
 {
   if (state)
   {
-    Serial.println("LED turned ON " + WiFi.softAPIP().toString());
+    Serial.println("LED turned ON " + WiFi.softAPIP().toString() + " " + server.client().remoteIP().toString());
   }
   else
   {
-    Serial.println("LED turned OFF "+ WiFi.softAPIP().toString());
+    Serial.println("LED turned OFF "+ WiFi.softAPIP().toString() + " " + server.client().remoteIP().toString());
   }
 
   if (wifiSetupState == CONNECTED) {
@@ -75,8 +88,18 @@ void printLEDState(bool state)
     Serial.println(" Local IP: " + WiFi.localIP().toString());
   }
   
+  String info = "";
+
+  switch(global_state.fridge_door) {
+    case FRIDGE_DOOR_UNKNOWN_STATE: info += "FRIDGE_DOOR_UNKNOWN_STATE"; break;
+    case FRIDGE_DOOR_RECENTLY_OPENED: info += "FRIDGE_DOOR_RECENTLY_OPENED"; break;
+    case FRIDGE_DOOR_LONG_AGO_OPENED: info += "FRIDGE_DOOR_LONG_AGO_OPENED"; break;
+    case FRIDGE_DOOR_RECENTLY_CLOSED: info += "FRIDGE_DOOR_RECENTLY_CLOSED"; break;
+    case FRIDGE_DOOR_LONG_AGO_CLOSED: info += "FRIDGE_DOOR_LONG_AGO_CLOSED"; break;
+  }
+  
   if (dht.getStatus() == 0) { //Judge if the correct value is read
-    String info = " Light:" + String(global_state.light) + " Temperature:" + String(global_state.temperature) + " C"+" Humidity:" + String(global_state.humidity)+" %";
+    info = info + " Light:" + String(global_state.light) + " Temperature:" + String(global_state.temperature) + " C"+" Humidity:" + String(global_state.humidity)+" %";
     Serial.println(info);
     memcpy(global_state.info, info.c_str(), sizeof(global_state.info));
   }
@@ -138,14 +161,30 @@ bool isGarbage(const char *value, int length)
   return false; // No invalid characters found
 }
 
-void stateMachineWiFi()
+bool stateMachineWiFi()
 {
   static char storedSSID[32];
   static char storedPassword[32];
   static unsigned long startMillis;
-
+  
+  WiFiSetupState previousState = wifiSetupState;
   switch (wifiSetupState)
   {
+  case INIT:
+    Serial.println("Init WiFi...");
+    WiFi.mode(WIFI_AP_STA);
+
+    // Configure softAP with custom IP and DHCP settings
+    WiFi.softAPConfig(apIP, apIP, netMsk);
+    WiFi.softAP("ESP8266-AP", "password");
+    
+    wifiSetupState = DISCONNECT;
+    break;
+  case DISCONNECT:
+    Serial.println("Disconnect previous connections...");
+    WiFi.disconnect(true);
+    wifiSetupState = CHECK_SSID;
+    break;
   case CHECK_SSID:
     Serial.println("Checking stored SSID...");
     readFromEEPROM(ssidAddress, storedSSID, 32);
@@ -161,11 +200,13 @@ void stateMachineWiFi()
     {
       Serial.println("Stored password is garbage. Using default password.");
       strcpy(storedPassword, defaultPassword);
+      global_state.wifi_configured = false;
     }
     
     if (!isGarbage(storedSSID, sizeof(storedSSID)) && !isGarbage(storedPassword, sizeof(storedPassword)))
     {
       wifiSetupState = CONNECT_WIFI;
+      global_state.wifi_configured = true;
     }
     else
     {
@@ -215,6 +256,101 @@ void stateMachineWiFi()
     }
     break;
   }
+  return previousState != wifiSetupState;
+}
+
+// period
+// repeat_4_times
+// crick_4_times
+// base
+void cricket_beep(unsigned long startMillis, unsigned long beep_millis) {
+  unsigned long state_period = millis() - startMillis;
+  unsigned long sign_period = state_period % 40000;
+
+  unsigned long crick_4_times_period = sign_period % (700*8);
+  bool crick_4_times = false;
+  for (int i=0; i < 4; i++) {
+    unsigned int start = 0 + i * 700;
+    unsigned int end = 500 + i * 700;
+    if (start < crick_4_times_period && crick_4_times_period < end)
+    {
+      crick_4_times = true;
+      break;
+    }
+  }
+  const bool base = ((sign_period % 30) > 15);
+  if ( (sign_period < beep_millis)  && crick_4_times && base) {
+    digitalWrite(buzzerPin, LOW);
+    //digitalWrite(buzzerPin, HIGH);
+  } else {
+    digitalWrite(buzzerPin, LOW);
+  }
+
+}
+
+void transitions_door_state() {
+  if (global_state.light > 50) {
+    if (global_state.fridge_door != FRIDGE_DOOR_RECENTLY_OPENED && global_state.fridge_door != FRIDGE_DOOR_LONG_AGO_OPENED)
+      global_state.fridge_door = FRIDGE_DOOR_RECENTLY_OPENED;
+  } else {
+    if (global_state.fridge_door != FRIDGE_DOOR_RECENTLY_CLOSED && global_state.fridge_door != FRIDGE_DOOR_LONG_AGO_CLOSED)
+      global_state.fridge_door = FRIDGE_DOOR_RECENTLY_CLOSED;
+  }
+}
+
+bool fridge_door_closed() {
+  return global_state.light > 50;
+}
+
+bool stateMachineFridge() {
+  static unsigned long current_state_start = 0;
+  bool alert = false;
+
+  FridgeDoorState previousState = global_state.fridge_door;
+  switch (global_state.fridge_door)
+  {
+    case FRIDGE_DOOR_UNKNOWN_STATE:
+      // If door is closed, transition directly to FRIDGE_DOOR_RECENTLY_CLOSED
+      // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
+      break;
+    case FRIDGE_DOOR_RECENTLY_OPENED:
+      alert = true;
+      // Turn off fan
+      // Do one beep if there were pending notifications
+      // Wait for 30 seconds
+      // If door is closed, transition directly to FRIDGE_DOOR_RECENTLY_CLOSED
+      break;
+    case FRIDGE_DOOR_LONG_AGO_OPENED:
+      alert = true;
+      // Fan stays off
+      // Start beeping in a perdiodic manner
+      // If door is closed, transition directly to FRIDGE_DOOR_RECENTLY_CLOSED
+      break;
+    case FRIDGE_DOOR_RECENTLY_CLOSED:
+      // Immediate Fan on
+      // No beepeing
+      // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
+      // Wait for 5 minutes before FRIDGE_DOOR_LONG_AGO_CLOSED
+      break;
+    case FRIDGE_DOOR_LONG_AGO_CLOSED:
+      // Alternate fan
+      // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
+      break;
+  }
+
+  if (alert) {
+    cricket_beep(current_state_start, 10000);
+  } else {
+    digitalWrite(buzzerPin, LOW);
+  }
+
+  transitions_door_state();
+  bool change_state = previousState != global_state.fridge_door;
+  if (change_state) {
+    current_state_start = millis();
+  }
+
+  return change_state;
 }
 
 void handleRoot()
@@ -243,11 +379,13 @@ void handleRoot()
   html += "<p>WiFi Connection Status: " + connectionStatus + "</p>";
   html += "<p>" + connectedSSID + "</p>";
   html += "<p>" + connectedIP + "</p>";
-  html += "<form action='/update' method='post'>";
-  html += "New SSID: <input type='text' name='new_ssid'><br>";
-  html += "New Password: <input type='password' name='new_password'><br>";
-  html += "<input type='submit' value='Update WiFi'>";
-  html += "</form>";
+  if (!global_state.wifi_configured) {
+    html += "<form action='/update' method='post'>";
+    html += "New SSID: <input type='text' name='new_ssid'><br>";
+    html += "New Password: <input type='password' name='new_password'><br>";
+    html += "<input type='submit' value='Update WiFi'>";
+    html += "</form>";
+  }
   html += "<script>function updateInfo(){"
     "var xhttp=new XMLHttpRequest();"
     "xhttp.onreadystatechange=function(){"
@@ -319,8 +457,7 @@ void ICACHE_RAM_ATTR buttonInterrupt() {
     writeToEEPROM(passwordAddress, &zero, 1 );
     readFromEEPROM(ssidAddress, &dummy, 1 );
     readFromEEPROM(passwordAddress, &dummy, 1 );
-    wifiSetupState = CHECK_SSID;
-    WiFi.disconnect(true);
+    wifiSetupState = DISCONNECT;
   }
 
   // Print the button state (HIGH or LOW)
@@ -356,12 +493,6 @@ void setup()
   Serial.println("\nSerial port setup complete.");
   Serial.println("===================================");
 
-
-  WiFi.mode(WIFI_AP_STA);
-
-  // Configure softAP with custom IP and DHCP settings
-  WiFi.softAPConfig(apIP, apIP, netMsk);
-  WiFi.softAP("ESP8266-AP", "password");
 
   // Start the server
   Serial.println("Starting server...");
@@ -423,5 +554,8 @@ void loop()
   }
 
   // Non-blocking setupWiFi
-  stateMachineWiFi();
+  while (stateMachineFridge());
+
+  // Non-blocking setupWiFi
+  while (stateMachineWiFi());
 }
