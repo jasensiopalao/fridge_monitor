@@ -2,6 +2,20 @@
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
 
+#include <ArduinoOTA.h>
+
+// ESP8266TimerInterrupt@1.6.0
+#include "ESP8266TimerInterrupt.h"
+
+// Select a Timer Clock
+#define USING_TIM_DIV1                false           // for shortest and most accurate timer
+#define USING_TIM_DIV16               false           // for medium time and medium accurate timer
+#define USING_TIM_DIV256              true            // for longest timer but least accurate. Default
+
+// Init ESP8266 only and only Timer 1
+ESP8266Timer ITimer;
+#define TIMER_INTERVAL_MS        1000
+
 // DHT sensor library for ESPx@1.19.0
 #include "DHTesp.h"
 DHTesp dht; //Define the DHT object
@@ -16,20 +30,40 @@ char defaultSSID[32] = "";
 char defaultPassword[32] = "";
 
 // EEPROM addresses for ssid and password
-int ssidAddress = 0;
-int passwordAddress = 32;
+const int ssidAddress = 0;
+const int passwordAddress = 32;
+const int beenEnable = 33;
 
 // Create an instance of the ESP8266WebServer class
 ESP8266WebServer server(80);
+ESP8266WebServer serial_server(8080);
 
-const int ledPin = 2; // GPIO 2
-const int buttonPin = 0; // GPIO 0
-const int fanPin = 4; // GPIO 4
+// 1 RST Reset Pin, Active Low
+// 2 ADC AD conversion, Input voltage range 0~3.3V, the value range is 0~1024.
+const int fotoresistorPin = A0;  // Analog pin. 
+// 3 EN Chip Enabled Pin, Active High
+// 4 IO16 Connect with RST pin to wake up Deep Sleep
+// 5 IO14 GPIO14; HSPI_CLK
+// 6 IO12 GPIO12; HSPI_MISO
+const int lightFridgePin = 12;  // Pull up
+// 7 IO13 GPIO13; HSPI_MOSI; UART0_CTS
+const int dhtPin = 13;//Define the dht pin 
+// 8 VCC Module power supply pin, Voltage 3.0V ~ 3.6V
+// 9 GND GND
+// 10 IO15 GPIO15; MTDO; HSPICS; UART0_RTS
 const int buzzerPin = 15; // GPIO 15
-const int dhtPin = 13;//Define the dht pin
-const int fotoresistorPin = A0;  // Analog pin 
-
+// 11 IO2 GPIO2; UART1_TXD
+const int ledPin = 2; // GPIO 2
+// 12 IO0 GPIO0;HSPI_MISO;I2SI_DATA
+const int buttonPin = 0; // GPIO 0
+// 13 IO4 GPIO4
+const int fanPin = 4; // GPIO 4. Brown
+// 14 IO5 GPIO5;IR_R
+const int doorFridgePin = 5;  // Pull up
+// 15 RXD UART0_RXD; GPIO3
+// 16 TXD UART0_TXD; GPIO1
 // Variable to store the button state
+
 int buttonState = 0;
 
 // Variables for LED blink
@@ -39,8 +73,10 @@ const long interval = 1000; // Blink interval in milliseconds
 enum FridgeDoorState
 {
   FRIDGE_DOOR_UNKNOWN_STATE,
+  FRIDGE_DOOR_JUST_OPENED,
   FRIDGE_DOOR_RECENTLY_OPENED,
   FRIDGE_DOOR_LONG_AGO_OPENED,
+  FRIDGE_DOOR_JUST_CLOSED,
   FRIDGE_DOOR_RECENTLY_CLOSED,
   FRIDGE_DOOR_LONG_AGO_CLOSED
 };
@@ -61,23 +97,36 @@ bool late_setup_done = false;
 
 struct GlobalState {
   bool wifi_configured = false;
-  int light = 0;
+  int analogValue = 0;
+  bool light_on = false;
+  bool door_contact_closed = false;
+  bool initialized_records = false;
   float temperature = 0.0f;
   float humidity = 0.0f;
-  char info[120] = "";
+  float min_temperature = 0.0f;
+  float min_temperature_humidity = 0.0f;
+  float max_temperature = 0.0f;
+  float max_temperature_humidity = 0.0f;
+  float min_humidity = 0.0f;
+  float min_humidity_temperature = 0.0f;
+  float max_humidity = 0.0f;
+  float max_humidity_temperature = 0.0f;
   FridgeDoorState fridge_door = FRIDGE_DOOR_UNKNOWN_STATE;
-} global_state;
+  bool alert = false;
+  int beeps = false;
+  int beep_period = 0;
+  bool ota = false;
+  unsigned long current_state_start = 0;
+  unsigned long current_ota_time = 0;
+  bool handle_ota=true;
+};
 
-void printLEDState(bool state)
+volatile GlobalState global_state;
+char info_[250] = "";
+
+void updateInfoString(bool state)
 {
-  if (state)
-  {
-    Serial.println("LED turned ON " + WiFi.softAPIP().toString() + " " + server.client().remoteIP().toString());
-  }
-  else
-  {
-    Serial.println("LED turned OFF "+ WiFi.softAPIP().toString() + " " + server.client().remoteIP().toString());
-  }
+  Serial.println("LED turned OFF "+ WiFi.softAPIP().toString() + " " + server.client().remoteIP().toString());
 
   if (wifiSetupState == CONNECTED) {
     int coverage = map(WiFi.RSSI(), 32, -90, 100, 0);
@@ -89,20 +138,33 @@ void printLEDState(bool state)
   }
   
   String info = "";
+  if (global_state.ota) {
+    info = String((millis() - global_state.current_ota_time)/1000) + " <br>";
+  }
 
   switch(global_state.fridge_door) {
-    case FRIDGE_DOOR_UNKNOWN_STATE: info += "FRIDGE_DOOR_UNKNOWN_STATE"; break;
-    case FRIDGE_DOOR_RECENTLY_OPENED: info += "FRIDGE_DOOR_RECENTLY_OPENED"; break;
-    case FRIDGE_DOOR_LONG_AGO_OPENED: info += "FRIDGE_DOOR_LONG_AGO_OPENED"; break;
-    case FRIDGE_DOOR_RECENTLY_CLOSED: info += "FRIDGE_DOOR_RECENTLY_CLOSED"; break;
-    case FRIDGE_DOOR_LONG_AGO_CLOSED: info += "FRIDGE_DOOR_LONG_AGO_CLOSED"; break;
+    case FRIDGE_DOOR_UNKNOWN_STATE: info += "FRIDGE_DOOR_UNKNOWN_STATE "; break;
+    case FRIDGE_DOOR_JUST_OPENED: info += "FRIDGE_DOOR_JUST_OPENED "; break;
+    case FRIDGE_DOOR_RECENTLY_OPENED: info += "FRIDGE_DOOR_RECENTLY_OPENED "; break;
+    case FRIDGE_DOOR_LONG_AGO_OPENED: info += "FRIDGE_DOOR_LONG_AGO_OPENED "; break;
+    case FRIDGE_DOOR_RECENTLY_CLOSED: info += "FRIDGE_DOOR_RECENTLY_CLOSED "; break;
+    case FRIDGE_DOOR_JUST_CLOSED: info += "FRIDGE_DOOR_JUST_CLOSED "; break;
+    case FRIDGE_DOOR_LONG_AGO_CLOSED: info += "FRIDGE_DOOR_LONG_AGO_CLOSED "; break;
   }
   
-  if (dht.getStatus() == 0) { //Judge if the correct value is read
-    info = info + " Light:" + String(global_state.light) + " Temperature:" + String(global_state.temperature) + " C"+" Humidity:" + String(global_state.humidity)+" %";
-    Serial.println(info);
-    memcpy(global_state.info, info.c_str(), sizeof(global_state.info));
-  }
+  
+  info = info + " ADC:" + String(global_state.analogValue) + " Light:" + String(global_state.light_on) + " DoorClosed:" + String(global_state.door_contact_closed) + " Temperature:" + String(global_state.temperature) + " C"+" Humidity:" + String(global_state.humidity)+" % "  + " <br>";
+
+
+  
+  info = info + "C Min/Max " + String(global_state.min_temperature) + " (" + String(global_state.min_temperature_humidity) + ") " +
+    String(global_state.max_temperature) + " (" + String(global_state.max_temperature_humidity) + ")"  + " <br>";
+  
+  info = info + "% Min/Max " + String(global_state.min_humidity) + " (" + String(global_state.min_humidity_temperature) + ") " +
+    String(global_state.max_humidity) + " (" + String(global_state.max_humidity_temperature) + ")"  + " <br>";
+
+  Serial.println(info);
+  memcpy(info_, info.c_str(), sizeof(info_));
   
 }
 
@@ -280,74 +342,96 @@ void cricket_beep(unsigned long startMillis, unsigned long beep_millis) {
   }
   const bool base = ((sign_period % 30) > 15);
   if ( (sign_period < beep_millis)  && crick_4_times && base) {
-    digitalWrite(buzzerPin, LOW);
-    //digitalWrite(buzzerPin, HIGH);
+    //digitalWrite(buzzerPin, LOW);
+    digitalWrite(buzzerPin, HIGH);
   } else {
     digitalWrite(buzzerPin, LOW);
   }
-
 }
 
 void transitions_door_state() {
-  if (global_state.light > 50) {
-    if (global_state.fridge_door != FRIDGE_DOOR_RECENTLY_OPENED && global_state.fridge_door != FRIDGE_DOOR_LONG_AGO_OPENED)
-      global_state.fridge_door = FRIDGE_DOOR_RECENTLY_OPENED;
+  if (!global_state.door_contact_closed) {
+    if (global_state.fridge_door != FRIDGE_DOOR_JUST_OPENED && global_state.fridge_door != FRIDGE_DOOR_RECENTLY_OPENED && global_state.fridge_door != FRIDGE_DOOR_LONG_AGO_OPENED)
+      change_fridge_state(FRIDGE_DOOR_JUST_OPENED);
   } else {
-    if (global_state.fridge_door != FRIDGE_DOOR_RECENTLY_CLOSED && global_state.fridge_door != FRIDGE_DOOR_LONG_AGO_CLOSED)
-      global_state.fridge_door = FRIDGE_DOOR_RECENTLY_CLOSED;
+    if (global_state.fridge_door != FRIDGE_DOOR_JUST_CLOSED && global_state.fridge_door != FRIDGE_DOOR_RECENTLY_CLOSED && global_state.fridge_door != FRIDGE_DOOR_LONG_AGO_CLOSED)
+      change_fridge_state(FRIDGE_DOOR_JUST_CLOSED);
   }
 }
 
-bool fridge_door_closed() {
-  return global_state.light > 50;
+void cricket_off() {
+  if (global_state.alert) {
+    digitalWrite(buzzerPin, LOW);
+    global_state.alert = false;
+  }
+}
+
+void cricket_on() {
+  global_state.alert = true;
+}
+
+void change_fridge_state(FridgeDoorState new_state) {
+  global_state.fridge_door = new_state;
+  global_state.current_state_start = 0;
 }
 
 bool stateMachineFridge() {
-  static unsigned long current_state_start = 0;
-  bool alert = false;
 
   FridgeDoorState previousState = global_state.fridge_door;
   switch (global_state.fridge_door)
   {
     case FRIDGE_DOOR_UNKNOWN_STATE:
+      cricket_off();
+      digitalWrite(fanPin, LOW);
       // If door is closed, transition directly to FRIDGE_DOOR_RECENTLY_CLOSED
       // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
       break;
+    case FRIDGE_DOOR_JUST_OPENED:
+      cricket_off();
+      digitalWrite(fanPin, LOW);
+      change_fridge_state(FRIDGE_DOOR_RECENTLY_OPENED);
+      break;
     case FRIDGE_DOOR_RECENTLY_OPENED:
-      alert = true;
+      cricket_off();
+      digitalWrite(fanPin, LOW);
       // Turn off fan
       // Do one beep if there were pending notifications
-      // Wait for 30 seconds
+      // Wait for 30 seconds4
+      if ((millis() - global_state.current_state_start) > 30000) {
+        change_fridge_state(FRIDGE_DOOR_LONG_AGO_OPENED);
+      }
       // If door is closed, transition directly to FRIDGE_DOOR_RECENTLY_CLOSED
       break;
     case FRIDGE_DOOR_LONG_AGO_OPENED:
-      alert = true;
+      cricket_on();
       // Fan stays off
       // Start beeping in a perdiodic manner
       // If door is closed, transition directly to FRIDGE_DOOR_RECENTLY_CLOSED
       break;
+    case FRIDGE_DOOR_JUST_CLOSED:
+      cricket_off();
+      change_fridge_state(FRIDGE_DOOR_RECENTLY_CLOSED);
+      break;
     case FRIDGE_DOOR_RECENTLY_CLOSED:
+      global_state.alert = false;
+    
+      digitalWrite(fanPin, HIGH);
       // Immediate Fan on
       // No beepeing
       // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
       // Wait for 5 minutes before FRIDGE_DOOR_LONG_AGO_CLOSED
       break;
     case FRIDGE_DOOR_LONG_AGO_CLOSED:
+      cricket_off();
       // Alternate fan
       // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
       break;
   }
 
-  if (alert) {
-    cricket_beep(current_state_start, 10000);
-  } else {
-    digitalWrite(buzzerPin, LOW);
-  }
-
   transitions_door_state();
   bool change_state = previousState != global_state.fridge_door;
-  if (change_state) {
-    current_state_start = millis();
+  if (change_state || global_state.current_state_start > millis()) {  // Cover overflow
+    global_state.current_state_start = millis();
   }
 
   return change_state;
@@ -375,7 +459,8 @@ void handleRoot()
   }
 
   String html = "<html><body>";
-  html += "<h1 id='info'>Info: " + String(global_state.light) + "</h1>";
+  html += "<h1 id='version'>version: 0.0.1 </h1>";
+  html += "<h1 id='info'>Info: " + String(info_) + "</h1>";
   html += "<p>WiFi Connection Status: " + connectionStatus + "</p>";
   html += "<p>" + connectedSSID + "</p>";
   html += "<p>" + connectedIP + "</p>";
@@ -386,6 +471,9 @@ void handleRoot()
     html += "<input type='submit' value='Update WiFi'>";
     html += "</form>";
   }
+  html += "<form action='/reset' method='post'>";
+  html += "<input type='submit' value='Reset records'>";
+  html += "</form>";
   html += "<script>function updateInfo(){"
     "var xhttp=new XMLHttpRequest();"
     "xhttp.onreadystatechange=function(){"
@@ -398,6 +486,11 @@ void handleRoot()
   server.send(200, "text/html", html);
 
   Serial.println("Handled root request.");
+}
+
+void handleReset() {
+  global_state.initialized_records = false;
+  server.send(200, "text/plain", "Reset done");
 }
 
 void handleUpdate()
@@ -439,7 +532,7 @@ void handleInfo()
 {
 
   // Respond with the simulated light
-  server.send(200, "text/plain", global_state.info);
+  server.send(200, "text/plain", info_);
 }
 
 // ISR definition with ICACHE_RAM_ATTR attribute
@@ -465,18 +558,76 @@ void ICACHE_RAM_ATTR buttonInterrupt() {
   Serial.println(buttonState);
 }
 
+
+#define HW_TIMER_INTERVAL_MS          1L
+
+#define INTERVAL_BEEP                 200
+#define TIMER_INTERVAL_5S             5000L
+#define TIMER_INTERVAL_11S            11000L
+#define TIMER_INTERVAL_101S           101000L
+
+void BeepHandler() {
+  if (global_state.beeps > 0) {
+    if (digitalRead(buzzerPin) == LOW){
+      digitalWrite(buzzerPin, HIGH);
+    } else {
+      global_state.beeps--;
+      digitalWrite(buzzerPin, LOW);
+    }
+    
+  }
+}
+
+void IRAM_ATTR TimerHandler()
+{
+  if (global_state.handle_ota) {
+    return;
+  }
+  if (global_state.beep_period > 0) {
+    global_state.beep_period--;
+  } else {
+    BeepHandler();
+    global_state.beep_period = INTERVAL_BEEP;
+  }
+  // Doing something here inside ISR
+    // Toggle the LED state
+  // if (digitalRead(ledPin) == HIGH)
+  // {
+  //   digitalWrite(ledPin, LOW);
+  //   // updateInfoString(false);
+  // }
+  // else
+  // {
+    // digitalWrite(buzzerPin, HIGH);
+    // delay(10);
+    // digitalWrite(buzzerPin, LOW);
+    //digitalWrite(ledPin, HIGH);
+    // updateInfoString(true);
+  // }
+
+  if (global_state.alert) {
+    cricket_beep(global_state.current_state_start, 10000);
+  } else if (global_state.beeps == 0) {
+    digitalWrite(buzzerPin, LOW);
+  }
+}
+
+
 void setup()
 {
   EEPROM.begin(512);
   // Set up LED pin
   pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LOW);
+  digitalWrite(ledPin, HIGH);
 
   pinMode(fanPin, OUTPUT);
   digitalWrite(fanPin, LOW);
 
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
+
+  pinMode(doorFridgePin, INPUT_PULLUP);
+  pinMode(lightFridgePin, INPUT_PULLUP); // For high sensitivity, disable the pullup INPUT_PULLUP
 
   dht.setup(dhtPin, DHTesp::DHT11);//Initialize the dht pin and dht object
 
@@ -498,8 +649,47 @@ void setup()
   Serial.println("Starting server...");
   server.on("/", HTTP_GET, handleRoot);
   server.on("/update", HTTP_POST, handleUpdate);
+  server.on("/reset", HTTP_POST, handleReset);
   server.on("/info", HTTP_GET, handleInfo); // New route for info
   server.begin();
+
+  
+  serial_server.on("/", HTTP_GET, handleRoot);
+  serial_server.begin();
+  
+  ITimer.attachInterruptInterval(HW_TIMER_INTERVAL_MS * TIMER_INTERVAL_MS, TimerHandler);
+
+
+
+  // Port defaults to 8266
+  ArduinoOTA.setPort(8266);
+
+  // Hostname defaults to esp8266-[ChipID]
+  ArduinoOTA.setHostname("myesp8266");
+
+  // No authentication by default
+  ArduinoOTA.setPassword((const char *)"password");
+  
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+
+  global_state.beeps = 2;
 }
 
 // Some functions, that depend on hardware to stabilize, get setup after the first interval is ready
@@ -511,18 +701,53 @@ void late_setup() {
 }
 
 void updateSensorData() {
-  int analogValue = analogRead(fotoresistorPin);
-  global_state.light = constrain(map(analogValue, 1024, 0, 0, 100), 0, 100); // Map the analog value to a light range
+  global_state.analogValue = analogRead(fotoresistorPin);
+  // global_state.light = constrain(map(analogValue, 1024, 0, 0, 100), 0, 100); // Map the analog value to a light range
+  global_state.light_on = digitalRead(lightFridgePin) == LOW;
+  global_state.door_contact_closed = digitalRead(doorFridgePin) == LOW;
 
   flag:TempAndHumidity newValues = dht.getTempAndHumidity(); //Get the Temperature and humidity
-  global_state.temperature = newValues.temperature;
-  global_state.humidity = newValues.humidity;
+  if (dht.getStatus() == 0) { //Judge if the correct value is read
+    global_state.temperature = newValues.temperature;
+    global_state.humidity = newValues.humidity;
+    if (!global_state.initialized_records) {
+      global_state.initialized_records = true;
+      global_state.min_temperature = global_state.temperature;
+      global_state.min_temperature_humidity = global_state.humidity;
+      global_state.max_temperature = global_state.temperature;
+      global_state.max_temperature_humidity = global_state.humidity;
+      global_state.min_humidity = global_state.humidity;
+      global_state.min_humidity_temperature = global_state.temperature;
+      global_state.max_humidity = global_state.humidity;
+      global_state.max_humidity_temperature = global_state.temperature;
+    }
+
+    if (global_state.temperature < global_state.min_temperature) {
+      global_state.min_temperature = global_state.temperature;
+      global_state.min_temperature_humidity = global_state.humidity;
+    }
+    if (global_state.temperature > global_state.max_temperature) {
+      global_state.max_temperature = global_state.temperature;
+      global_state.max_temperature_humidity = global_state.humidity;
+    }
+    if (global_state.humidity < global_state.min_humidity) {
+      global_state.min_humidity = global_state.humidity;
+      global_state.min_humidity_temperature = global_state.temperature;
+    }
+    if (global_state.humidity > global_state.max_humidity) {
+      global_state.max_humidity = global_state.humidity;
+      global_state.max_humidity_temperature = global_state.temperature;
+    }
+  }
 }
 
 void loop()
 {
   // Handle client requests
   server.handleClient();
+  
+  // Handle client requests
+  serial_server.handleClient();
 
   // Blink the LED
   unsigned long currentMillis = millis();
@@ -537,25 +762,40 @@ void loop()
     }
 
     updateSensorData();
-    // Toggle the LED state
-    if (digitalRead(ledPin) == HIGH)
-    {
-      digitalWrite(ledPin, LOW);
-      printLEDState(false);
-    }
-    else
-    {
-      // digitalWrite(buzzerPin, HIGH);
-      // delay(10);
-      // digitalWrite(buzzerPin, LOW);
-      digitalWrite(ledPin, HIGH);
-      printLEDState(true);
-    }
+    updateInfoString(true);
+    // // Toggle the LED state
+    // if (digitalRead(ledPin) == HIGH)
+    // {
+    //   digitalWrite(ledPin, LOW);
+    //   updateInfoString(false);
+    // }
+    // else
+    // {
+    //   // digitalWrite(buzzerPin, HIGH);
+    //   // delay(10);
+    //   // digitalWrite(buzzerPin, LOW);
+    //   digitalWrite(ledPin, HIGH);
+    //   updateInfoString(true);
+    // }
   }
 
-  // Non-blocking setupWiFi
-  while (stateMachineFridge());
+  for (int direct_transitions; stateMachineFridge() && direct_transitions < 5; direct_transitions++){
+    direct_transitions++;
+  }
 
-  // Non-blocking setupWiFi
-  while (stateMachineWiFi());
+  for (int direct_transitions; stateMachineWiFi() && direct_transitions < 10; direct_transitions++){
+    direct_transitions++;
+  }
+  
+  bool previous_ota = global_state.ota;
+  IPAddress client_ip = server.client().remoteIP();
+  global_state.ota = client_ip.isSet() && !client_ip.toString().startsWith("192.168.2");
+  if (!previous_ota && global_state.ota) {
+    global_state.current_ota_time = millis();
+  }
+  if (global_state.ota || true) {
+    global_state.handle_ota = true;
+    ArduinoOTA.handle();
+    global_state.handle_ota = false;
+  }
 }
