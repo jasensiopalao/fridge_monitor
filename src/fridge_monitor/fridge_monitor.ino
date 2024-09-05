@@ -4,6 +4,9 @@
 
 #include <ArduinoOTA.h>
 
+// Uptime Library@1.0.0
+#include "uptime_formatter.h"
+
 // ESP8266TimerInterrupt@1.6.0
 #include "ESP8266TimerInterrupt.h"
 
@@ -115,14 +118,21 @@ struct GlobalState {
   bool alert = false;
   int beeps = false;
   int beep_period = 0;
-  bool ota = false;
+  bool local_client = false;
   unsigned long current_state_start = 0;
-  unsigned long current_ota_time = 0;
+  unsigned long current_client_time = 0;
   bool handle_ota=true;
 };
 
 volatile GlobalState global_state;
 char info_[250] = "";
+
+int get_viewer_time() {
+  if (global_state.local_client) {
+    return (millis() - global_state.current_client_time)/1000;
+  }
+  return 0;
+}
 
 void updateInfoString(bool state)
 {
@@ -137,10 +147,7 @@ void updateInfoString(bool state)
     Serial.println(" Local IP: " + WiFi.localIP().toString());
   }
   
-  String info = "";
-  if (global_state.ota) {
-    info = String((millis() - global_state.current_ota_time)/1000) + " <br>";
-  }
+  String info = uptime_formatter::getUptime() + " Viewer " + get_viewer_time() + " <br>";
 
   switch(global_state.fridge_door) {
     case FRIDGE_DOOR_UNKNOWN_STATE: info += "FRIDGE_DOOR_UNKNOWN_STATE "; break;
@@ -388,6 +395,9 @@ bool stateMachineFridge() {
       break;
     case FRIDGE_DOOR_JUST_OPENED:
       cricket_off();
+      digitalWrite(buzzerPin, HIGH);
+      delay(2);
+      digitalWrite(buzzerPin, LOW);
       digitalWrite(fanPin, LOW);
       change_fridge_state(FRIDGE_DOOR_RECENTLY_OPENED);
       break;
@@ -397,32 +407,35 @@ bool stateMachineFridge() {
       // Turn off fan
       // Do one beep if there were pending notifications
       // Wait for 30 seconds4
-      if ((millis() - global_state.current_state_start) > 30000) {
+      if ((millis() - global_state.current_state_start) > (30 * 1000)) {
         change_fridge_state(FRIDGE_DOOR_LONG_AGO_OPENED);
+        cricket_on();
       }
       // If door is closed, transition directly to FRIDGE_DOOR_RECENTLY_CLOSED
       break;
     case FRIDGE_DOOR_LONG_AGO_OPENED:
-      cricket_on();
       // Fan stays off
       // Start beeping in a perdiodic manner
       // If door is closed, transition directly to FRIDGE_DOOR_RECENTLY_CLOSED
       break;
     case FRIDGE_DOOR_JUST_CLOSED:
+      digitalWrite(buzzerPin, HIGH);
+      delay(2);
+      digitalWrite(buzzerPin, LOW);
       cricket_off();
+      digitalWrite(fanPin, HIGH);
       change_fridge_state(FRIDGE_DOOR_RECENTLY_CLOSED);
       break;
     case FRIDGE_DOOR_RECENTLY_CLOSED:
-      global_state.alert = false;
-    
-      digitalWrite(fanPin, HIGH);
       // Immediate Fan on
       // No beepeing
       // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
       // Wait for 5 minutes before FRIDGE_DOOR_LONG_AGO_CLOSED
+      if ((millis() - global_state.current_state_start) > (5 * 60 * 1000)) {
+        change_fridge_state(FRIDGE_DOOR_LONG_AGO_CLOSED);
+      }
       break;
     case FRIDGE_DOOR_LONG_AGO_CLOSED:
-      cricket_off();
       // Alternate fan
       // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
       break;
@@ -444,18 +457,22 @@ void handleRoot()
   String connectionStatus;
   String connectedSSID;
   String connectedIP;
+  String connectedClientIP;
 
   if (WiFi.status() == WL_CONNECTED)
   {
     connectionStatus = "Connected";
     connectedSSID = "SSID: " + WiFi.SSID();
     connectedIP = WiFi.localIP().toString();
+    IPAddress client_ip = server.client().remoteIP();
+    connectedClientIP = "Client: " + client_ip.toString();
   }
   else
   {
     connectionStatus = "Not Connected";
     connectedSSID = "SSID: N/A";
     connectedIP = "IP: N/A";
+    connectedClientIP = "Client: N/A";
   }
 
   String html = "<html><body>";
@@ -464,7 +481,8 @@ void handleRoot()
   html += "<p>WiFi Connection Status: " + connectionStatus + "</p>";
   html += "<p>" + connectedSSID + "</p>";
   html += "<p>" + connectedIP + "</p>";
-  if (!global_state.wifi_configured) {
+  html += "<p>" + connectedClientIP + "</p>";
+  if (!global_state.wifi_configured || global_state.local_client) {
     html += "<form action='/update' method='post'>";
     html += "New SSID: <input type='text' name='new_ssid'><br>";
     html += "New Password: <input type='password' name='new_password'><br>";
@@ -523,7 +541,7 @@ void handleUpdate()
   Serial.println("WiFi credentials updated. Reconnecting to WiFi...");
 
   // Reconnect to WiFi with new credentials
-  wifiSetupState = CHECK_SSID;
+  wifiSetupState = DISCONNECT;
 
   server.send(200, "text/plain", "WiFi credentials updated. Please reconnect to the new WiFi.");
 }
@@ -787,13 +805,13 @@ void loop()
     direct_transitions++;
   }
   
-  bool previous_ota = global_state.ota;
+  bool previous_ota = global_state.local_client;
   IPAddress client_ip = server.client().remoteIP();
-  global_state.ota = client_ip.isSet() && !client_ip.toString().startsWith("192.168.2");
-  if (!previous_ota && global_state.ota) {
-    global_state.current_ota_time = millis();
+  global_state.local_client = client_ip.isSet() && !client_ip.toString().startsWith("192.168.2");
+  if (!previous_ota && global_state.local_client) {
+    global_state.current_client_time = millis();
   }
-  if (global_state.ota || true) {
+  if (global_state.local_client || true) {
     global_state.handle_ota = true;
     ArduinoOTA.handle();
     global_state.handle_ota = false;
