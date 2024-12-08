@@ -10,6 +10,14 @@
 // ESP8266TimerInterrupt@1.6.0
 #include "ESP8266TimerInterrupt.h"
 
+// For startup info and more
+extern "C" {
+#include "user_interface.h"
+}
+
+// Other
+// WebSerial@2.0.6
+
 // Select a Timer Clock
 #define USING_TIM_DIV1                false           // for shortest and most accurate timer
 #define USING_TIM_DIV16               false           // for medium time and medium accurate timer
@@ -99,6 +107,7 @@ WiFiSetupState wifiSetupState = INIT;
 bool late_setup_done = false;
 
 struct GlobalState {
+  int reset_reason=0;
   bool wifi_configured = false;
   int analogValue = 0;
   bool light_on = false;
@@ -125,7 +134,7 @@ struct GlobalState {
 };
 
 volatile GlobalState global_state;
-char info_[250] = "";
+char info_[500] = "";
 
 int get_viewer_time() {
   if (global_state.local_client) {
@@ -170,9 +179,24 @@ void updateInfoString(bool state)
   info = info + "% Min/Max " + String(global_state.min_humidity) + " (" + String(global_state.min_humidity_temperature) + ") " +
     String(global_state.max_humidity) + " (" + String(global_state.max_humidity_temperature) + ")"  + " <br>";
 
-  Serial.println(info);
-  memcpy(info_, info.c_str(), sizeof(info_));
+  uint32_t free = system_get_free_heap_size();
+  info = info + "free " + String(free) + " local " + String(global_state.local_client) + " <br>";
+
+  switch(global_state.reset_reason) {
+    case REASON_DEFAULT_RST: info += "normal startup by power on <br>"; break;
+    case REASON_WDT_RST: info += "hardware watch dog reset <br>"; break;
+    case REASON_EXCEPTION_RST: info += "exception reset, GPIO status won’t change <br>"; break;
+    case REASON_SOFT_WDT_RST: info += "software watch dog reset, GPIO status won’t change <br>"; break;
+    case REASON_SOFT_RESTART: info += "software restart ,system_restart , GPIO status won’t change <br>"; break;
+    case REASON_DEEP_SLEEP_AWAKE: info += "wake up from deep-sleep <br>"; break;
+    case REASON_EXT_SYS_RST: info += "external system reset <br>"; break;
+  }
   
+  info = info + String(info.length()+1);
+
+  memcpy(info_, info.c_str(), min(info.length()+1, sizeof(info_)));
+  info_[sizeof(info_)-1] = 0;
+  Serial.println(info_);
 }
 
 void writeToEEPROM(int address, const char *data, int dataSize) {
@@ -476,7 +500,7 @@ void handleRoot()
   }
 
   String html = "<html><body>";
-  html += "<h1 id='version'>version: 0.0.1 </h1>";
+  html += "<h1 id='version'>version: 0.0.2 </h1>";
   html += "<h1 id='info'>Info: " + String(info_) + "</h1>";
   html += "<p>WiFi Connection Status: " + connectionStatus + "</p>";
   html += "<p>" + connectedSSID + "</p>";
@@ -548,7 +572,6 @@ void handleUpdate()
 
 void handleInfo()
 {
-
   // Respond with the simulated light
   server.send(200, "text/plain", info_);
 }
@@ -708,6 +731,12 @@ void setup()
   ArduinoOTA.begin();
 
   global_state.beeps = 2;
+
+  Serial.println("We're alive") ;
+  rst_info *rinfo;
+  rinfo = ESP.getResetInfoPtr();
+  global_state.reset_reason = (int)rinfo->reason;
+  Serial.println(String("ResetInfo.reason = ") + (int)rinfo->reason);
 }
 
 // Some functions, that depend on hardware to stabilize, get setup after the first interval is ready
