@@ -106,8 +106,14 @@ enum WiFiSetupState
 WiFiSetupState wifiSetupState = INIT;
 bool late_setup_done = false;
 
+// variable to hold the time
+//unsigned long program_counter attribute ((section (".noinit")));
+unsigned long program_counter __attribute__ ((section(".noinit")));
+// unsigned long program_counter;
+
 struct GlobalState {
   int reset_reason=0;
+  unsigned long program_counter_previous;
   bool wifi_configured = false;
   int analogValue = 0;
   bool light_on = false;
@@ -182,6 +188,8 @@ void updateInfoString(bool state)
   uint32_t free = system_get_free_heap_size();
   info = info + "free " + String(free) + " local " + String(global_state.local_client) + " <br>";
 
+  program_counter = __LINE__;
+  info = info + " previous last state " + String(global_state.program_counter_previous) + " " + String(program_counter) + " <br>";
   switch(global_state.reset_reason) {
     case REASON_DEFAULT_RST: info += "normal startup by power on <br>"; break;
     case REASON_WDT_RST: info += "hardware watch dog reset <br>"; break;
@@ -500,7 +508,7 @@ void handleRoot()
   }
 
   String html = "<html><body>";
-  html += "<h1 id='version'>version: 0.0.2 </h1>";
+  html += __DATE__ " "  __TIME__ " version: 0.0.3";
   html += "<h1 id='info'>Info: " + String(info_) + "</h1>";
   html += "<p>WiFi Connection Status: " + connectionStatus + "</p>";
   html += "<p>" + connectedSSID + "</p>";
@@ -737,6 +745,8 @@ void setup()
   rinfo = ESP.getResetInfoPtr();
   global_state.reset_reason = (int)rinfo->reason;
   Serial.println(String("ResetInfo.reason = ") + (int)rinfo->reason);
+
+  global_state.program_counter_previous = program_counter;
 }
 
 // Some functions, that depend on hardware to stabilize, get setup after the first interval is ready
@@ -791,9 +801,11 @@ void updateSensorData() {
 void loop()
 {
   // Handle client requests
+  program_counter = __LINE__;
   server.handleClient();
   
   // Handle client requests
+  program_counter = __LINE__;
   serial_server.handleClient();
 
   // Blink the LED
@@ -807,8 +819,10 @@ void loop()
     if (late_setup_done == false) {
       late_setup();
     }
-
+    
+    program_counter = __LINE__;
     updateSensorData();
+    program_counter = __LINE__;
     updateInfoString(true);
     // // Toggle the LED state
     // if (digitalRead(ledPin) == HIGH)
@@ -826,23 +840,28 @@ void loop()
     // }
   }
 
+  program_counter = __LINE__;
   for (int direct_transitions; stateMachineFridge() && direct_transitions < 5; direct_transitions++){
     direct_transitions++;
   }
 
+  program_counter = __LINE__;
   for (int direct_transitions; stateMachineWiFi() && direct_transitions < 10; direct_transitions++){
     direct_transitions++;
   }
   
+  program_counter = __LINE__;
   bool previous_ota = global_state.local_client;
   IPAddress client_ip = server.client().remoteIP();
   global_state.local_client = client_ip.isSet() && !client_ip.toString().startsWith("192.168.2");
   if (!previous_ota && global_state.local_client) {
     global_state.current_client_time = millis();
   }
+  program_counter = __LINE__;
   if (global_state.local_client || true) {
     global_state.handle_ota = true;
     ArduinoOTA.handle();
     global_state.handle_ota = false;
   }
+  program_counter = __LINE__;
 }
