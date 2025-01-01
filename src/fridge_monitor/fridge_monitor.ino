@@ -34,16 +34,19 @@ DHTesp dht; //Define the DHT object
 // sudo chmod a+rw /dev/ttyUSB0
 IPAddress apIP(192, 168, 2, 1);
 IPAddress netMsk(255, 255, 255, 0);
-  
 
 // Replace with your network credentials
+#define SIZE_SSDID 32
+#define SIZE_PASSWORD 32
+
+#define EEPROM_ADDRESS_SSID 0
+#define EEPROM_ADDRESS_PASSWORD SIZE_SSDID + EEPROM_ADDRESS_SSID
 char defaultSSID[32] = "";
 char defaultPassword[32] = "";
 
 // EEPROM addresses for ssid and password
 const int ssidAddress = 0;
-const int passwordAddress = 32;
-const int beenEnable = 33;
+const int passwordAddress = EEPROM_ADDRESS_PASSWORD;
 
 // Create an instance of the ESP8266WebServer class
 ESP8266WebServer server(80);
@@ -107,11 +110,14 @@ WiFiSetupState wifiSetupState = INIT;
 bool late_setup_done = false;
 
 // variable to hold the time
-//unsigned long program_counter attribute ((section (".noinit")));
-unsigned long program_counter __attribute__ ((section(".noinit")));
-// unsigned long program_counter;
+struct RetainedState {
+  unsigned long garbage_id;
+  unsigned long program_counter;
+  bool enabled_ota;
+};
+volatile RetainedState retained_state __attribute__ ((section(".noinit")));
 
-struct GlobalState {
+struct NormalState {
   int reset_reason=0;
   unsigned long program_counter_previous;
   bool wifi_configured = false;
@@ -136,15 +142,15 @@ struct GlobalState {
   bool local_client = false;
   unsigned long current_state_start = 0;
   unsigned long current_client_time = 0;
-  bool handle_ota=true;
+  bool handling_ota=true;
 };
+volatile NormalState normal_state;
 
-volatile GlobalState global_state;
 char info_[500] = "";
 
 int get_viewer_time() {
-  if (global_state.local_client) {
-    return (millis() - global_state.current_client_time)/1000;
+  if (normal_state.local_client) {
+    return (millis() - normal_state.current_client_time)/1000;
   }
   return 0;
 }
@@ -164,7 +170,7 @@ void updateInfoString(bool state)
   
   String info = uptime_formatter::getUptime() + " Viewer " + get_viewer_time() + " <br>";
 
-  switch(global_state.fridge_door) {
+  switch(normal_state.fridge_door) {
     case FRIDGE_DOOR_UNKNOWN_STATE: info += "FRIDGE_DOOR_UNKNOWN_STATE "; break;
     case FRIDGE_DOOR_JUST_OPENED: info += "FRIDGE_DOOR_JUST_OPENED "; break;
     case FRIDGE_DOOR_RECENTLY_OPENED: info += "FRIDGE_DOOR_RECENTLY_OPENED "; break;
@@ -175,33 +181,36 @@ void updateInfoString(bool state)
   }
   
   
-  info = info + " ADC:" + String(global_state.analogValue) + " Light:" + String(global_state.light_on) + " DoorClosed:" + String(global_state.door_contact_closed) + " Temperature:" + String(global_state.temperature) + " C"+" Humidity:" + String(global_state.humidity)+" % "  + " <br>";
+  info = info + " ADC:" + String(normal_state.analogValue) + " Light:" + String(normal_state.light_on) + " DoorClosed:" + String(normal_state.door_contact_closed) + " <br>";
+  
+  info = info + "Temperature:" + String(normal_state.temperature) + " C"+" Humidity:" + String(normal_state.humidity)+" % "  + " <br>";
 
 
+  info = info + "C Min/Max " + String(normal_state.min_temperature) + " (" + String(normal_state.min_temperature_humidity) + ") " +
+    String(normal_state.max_temperature) + " (" + String(normal_state.max_temperature_humidity) + ")"  + " <br>";
   
-  info = info + "C Min/Max " + String(global_state.min_temperature) + " (" + String(global_state.min_temperature_humidity) + ") " +
-    String(global_state.max_temperature) + " (" + String(global_state.max_temperature_humidity) + ")"  + " <br>";
-  
-  info = info + "% Min/Max " + String(global_state.min_humidity) + " (" + String(global_state.min_humidity_temperature) + ") " +
-    String(global_state.max_humidity) + " (" + String(global_state.max_humidity_temperature) + ")"  + " <br>";
+  info = info + "% Min/Max " + String(normal_state.min_humidity) + " (" + String(normal_state.min_humidity_temperature) + ") " +
+    String(normal_state.max_humidity) + " (" + String(normal_state.max_humidity_temperature) + ")"  + " <br>";
 
   uint32_t free = system_get_free_heap_size();
-  info = info + "free " + String(free) + " local " + String(global_state.local_client) + " <br>";
+  info = info + "free " + String(free) + " local " + String(normal_state.local_client) + " <br>";
 
-  program_counter = __LINE__;
-  info = info + " previous last state " + String(global_state.program_counter_previous) + " " + String(program_counter) + " <br>";
-  switch(global_state.reset_reason) {
+  retained_state.program_counter = __LINE__;
+  info = info + " previous last state " + String(normal_state.program_counter_previous) + " " + String(retained_state.program_counter) + " <br>";
+  switch(normal_state.reset_reason) {
     case REASON_DEFAULT_RST: info += "normal startup by power on <br>"; break;
     case REASON_WDT_RST: info += "hardware watch dog reset <br>"; break;
-    case REASON_EXCEPTION_RST: info += "exception reset, GPIO status won’t change <br>"; break;
-    case REASON_SOFT_WDT_RST: info += "software watch dog reset, GPIO status won’t change <br>"; break;
-    case REASON_SOFT_RESTART: info += "software restart ,system_restart , GPIO status won’t change <br>"; break;
+    case REASON_EXCEPTION_RST: info += "exception reset, GPIO status will not change <br>"; break;
+    case REASON_SOFT_WDT_RST: info += "software watch dog reset, GPIO status will not change <br>"; break;
+    case REASON_SOFT_RESTART: info += "software restart ,system_restart , GPIO status will not change <br>"; break;
     case REASON_DEEP_SLEEP_AWAKE: info += "wake up from deep-sleep <br>"; break;
     case REASON_EXT_SYS_RST: info += "external system reset <br>"; break;
   }
   
-  info = info + String(info.length()+1);
+  info = info + "OTA Enabled: " + String(retained_state.enabled_ota) + " <br>";
+  info = info + "OTA Allowed: " + String(allowed_ota()) + " <br>";
 
+  info = info + String(info.length()+1);
   memcpy(info_, info.c_str(), min(info.length()+1, sizeof(info_)));
   info_[sizeof(info_)-1] = 0;
   Serial.println(info_);
@@ -274,10 +283,15 @@ bool stateMachineWiFi()
   case INIT:
     Serial.println("Init WiFi...");
     WiFi.mode(WIFI_AP_STA);
+    //WiFi.setMinSecurity(WIFI_AUTH_WPA2_WPA3_PSK);
 
     // Configure softAP with custom IP and DHCP settings
     WiFi.softAPConfig(apIP, apIP, netMsk);
     WiFi.softAP("ESP8266-AP", "password");
+
+    // 0    (for lowest RF power output, supply current ~ 70mA
+    // 20.5 (for highest RF power output, supply current ~ 80mA
+    WiFi.setOutputPower(17.0);
     
     wifiSetupState = DISCONNECT;
     break;
@@ -301,13 +315,13 @@ bool stateMachineWiFi()
     {
       Serial.println("Stored password is garbage. Using default password.");
       strcpy(storedPassword, defaultPassword);
-      global_state.wifi_configured = false;
+      normal_state.wifi_configured = false;
     }
     
     if (!isGarbage(storedSSID, sizeof(storedSSID)) && !isGarbage(storedPassword, sizeof(storedPassword)))
     {
       wifiSetupState = CONNECT_WIFI;
-      global_state.wifi_configured = true;
+      normal_state.wifi_configured = true;
     }
     else
     {
@@ -365,6 +379,7 @@ bool stateMachineWiFi()
 // crick_4_times
 // base
 void cricket_beep(unsigned long startMillis, unsigned long beep_millis) {
+  retained_state.program_counter = __LINE__;
   unsigned long state_period = millis() - startMillis;
   unsigned long sign_period = state_period % 40000;
 
@@ -386,38 +401,39 @@ void cricket_beep(unsigned long startMillis, unsigned long beep_millis) {
   } else {
     digitalWrite(buzzerPin, LOW);
   }
+  retained_state.program_counter = __LINE__;
 }
 
 void transitions_door_state() {
-  if (!global_state.door_contact_closed) {
-    if (global_state.fridge_door != FRIDGE_DOOR_JUST_OPENED && global_state.fridge_door != FRIDGE_DOOR_RECENTLY_OPENED && global_state.fridge_door != FRIDGE_DOOR_LONG_AGO_OPENED)
+  if (!normal_state.door_contact_closed) {
+    if (normal_state.fridge_door != FRIDGE_DOOR_JUST_OPENED && normal_state.fridge_door != FRIDGE_DOOR_RECENTLY_OPENED && normal_state.fridge_door != FRIDGE_DOOR_LONG_AGO_OPENED)
       change_fridge_state(FRIDGE_DOOR_JUST_OPENED);
   } else {
-    if (global_state.fridge_door != FRIDGE_DOOR_JUST_CLOSED && global_state.fridge_door != FRIDGE_DOOR_RECENTLY_CLOSED && global_state.fridge_door != FRIDGE_DOOR_LONG_AGO_CLOSED)
+    if (normal_state.fridge_door != FRIDGE_DOOR_JUST_CLOSED && normal_state.fridge_door != FRIDGE_DOOR_RECENTLY_CLOSED && normal_state.fridge_door != FRIDGE_DOOR_LONG_AGO_CLOSED)
       change_fridge_state(FRIDGE_DOOR_JUST_CLOSED);
   }
 }
 
 void cricket_off() {
-  if (global_state.alert) {
+  if (normal_state.alert) {
     digitalWrite(buzzerPin, LOW);
-    global_state.alert = false;
+    normal_state.alert = false;
   }
 }
 
 void cricket_on() {
-  global_state.alert = true;
+  normal_state.alert = true;
 }
 
 void change_fridge_state(FridgeDoorState new_state) {
-  global_state.fridge_door = new_state;
-  global_state.current_state_start = 0;
+  normal_state.fridge_door = new_state;
+  normal_state.current_state_start = 0;
 }
 
 bool stateMachineFridge() {
 
-  FridgeDoorState previousState = global_state.fridge_door;
-  switch (global_state.fridge_door)
+  FridgeDoorState previousState = normal_state.fridge_door;
+  switch (normal_state.fridge_door)
   {
     case FRIDGE_DOOR_UNKNOWN_STATE:
       cricket_off();
@@ -439,7 +455,7 @@ bool stateMachineFridge() {
       // Turn off fan
       // Do one beep if there were pending notifications
       // Wait for 30 seconds4
-      if ((millis() - global_state.current_state_start) > (30 * 1000)) {
+      if ((millis() - normal_state.current_state_start) > (30 * 1000)) {
         change_fridge_state(FRIDGE_DOOR_LONG_AGO_OPENED);
         cricket_on();
       }
@@ -463,7 +479,7 @@ bool stateMachineFridge() {
       // No beepeing
       // If door is open, transition directly to FRIDGE_DOOR_RECENTLY_OPENED
       // Wait for 5 minutes before FRIDGE_DOOR_LONG_AGO_CLOSED
-      if ((millis() - global_state.current_state_start) > (5 * 60 * 1000)) {
+      if ((millis() - normal_state.current_state_start) > (5 * 60 * 1000)) {
         change_fridge_state(FRIDGE_DOOR_LONG_AGO_CLOSED);
       }
       break;
@@ -474,9 +490,9 @@ bool stateMachineFridge() {
   }
 
   transitions_door_state();
-  bool change_state = previousState != global_state.fridge_door;
-  if (change_state || global_state.current_state_start > millis()) {  // Cover overflow
-    global_state.current_state_start = millis();
+  bool change_state = previousState != normal_state.fridge_door;
+  if (change_state || normal_state.current_state_start > millis()) {  // Cover overflow
+    normal_state.current_state_start = millis();
   }
 
   return change_state;
@@ -484,46 +500,53 @@ bool stateMachineFridge() {
 
 void handleRoot()
 {
-
-  // Get WiFi connection status and SSID
-  String connectionStatus;
-  String connectedSSID;
-  String connectedIP;
-  String connectedClientIP;
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    connectionStatus = "Connected";
-    connectedSSID = "SSID: " + WiFi.SSID();
-    connectedIP = WiFi.localIP().toString();
-    IPAddress client_ip = server.client().remoteIP();
-    connectedClientIP = "Client: " + client_ip.toString();
-  }
-  else
-  {
-    connectionStatus = "Not Connected";
-    connectedSSID = "SSID: N/A";
-    connectedIP = "IP: N/A";
-    connectedClientIP = "Client: N/A";
-  }
+  retained_state.program_counter = __LINE__;
 
   String html = "<html><body>";
   html += __DATE__ " "  __TIME__ " version: 0.0.3";
-  html += "<h1 id='info'>Info: " + String(info_) + "</h1>";
-  html += "<p>WiFi Connection Status: " + connectionStatus + "</p>";
-  html += "<p>" + connectedSSID + "</p>";
-  html += "<p>" + connectedIP + "</p>";
-  html += "<p>" + connectedClientIP + "</p>";
-  if (!global_state.wifi_configured || global_state.local_client) {
+  html += "<p id='info'>Info: " + String(info_) + "</p>";  //h1
+ 
+  html += "<p> APIP: " + WiFi.softAPIP().toString() + "</p>";
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    html += "<p> SSID: " + WiFi.SSID() + "</p>";
+    html += "<p> ESP IP: " + WiFi.localIP().toString() + "</p>";
+    html += "<p> Client IP: " + server.client().remoteIP().toString() + "</p>";
+  }
+  // https://stackoverflow.com/questions/25983603/how-to-submit-an-html-form-without-redirection
+  html += "<iframe name='dummyframe' id='dummyframe' style='display: none;'></iframe>";
+
+  html += "<form action='/enable_ota' method='post' target='dummyframe'>";
+  html += "<input type='submit' value='Enable OTA'>";
+  html += "</form>";
+
+  html += "<form action='/disable_ota' method='post' target='dummyframe'>";
+  html += "<input type='submit' value='Disable OTA'>";
+  html += "</form>";
+
+  html += "<form action='/clear_records' method='post' target='dummyframe'>";
+  html += "<input type='submit' value='Clear records'>";
+  html += "</form>";
+
+  if (!normal_state.wifi_configured || normal_state.local_client) {
+
+    html += "<form action='/reset' method='post' target='dummyframe'>";
+    html += "<input type='submit' value='Reset'>";
+    html += "</form>";
+
+    html += "<form action='/restart' method='post' target='dummyframe'>";
+    html += "<input type='submit' value='Restart'>";
+    html += "</form>";
+
     html += "<form action='/update' method='post'>";
     html += "New SSID: <input type='text' name='new_ssid'><br>";
     html += "New Password: <input type='password' name='new_password'><br>";
     html += "<input type='submit' value='Update WiFi'>";
     html += "</form>";
+
   }
-  html += "<form action='/reset' method='post'>";
-  html += "<input type='submit' value='Reset records'>";
-  html += "</form>";
+
+
   html += "<script>function updateInfo(){"
     "var xhttp=new XMLHttpRequest();"
     "xhttp.onreadystatechange=function(){"
@@ -536,16 +559,43 @@ void handleRoot()
   server.send(200, "text/html", html);
 
   Serial.println("Handled root request.");
+  retained_state.program_counter = __LINE__;
+}
+
+void handleClearRecords() {
+  retained_state.program_counter = __LINE__;
+  normal_state.initialized_records = false;
+  server.send(200, "text/plain", "Clear done");
+  retained_state.program_counter = __LINE__;
 }
 
 void handleReset() {
-  global_state.initialized_records = false;
-  server.send(200, "text/plain", "Reset done");
+  retained_state.program_counter = __LINE__;
+  server.send(200, "text/plain", "Reseting...");
+  ESP.reset();
+}
+
+void handleRestart() {
+  retained_state.program_counter = __LINE__;
+  server.send(200, "text/plain", "Restarting...");
+  ESP.restart();
+}
+
+void handleDisableOTA() {
+  retained_state.program_counter = __LINE__;
+  server.send(200, "", "");
+  retained_state.enabled_ota = false;
+}
+
+void handleEnableOTA() {
+  retained_state.program_counter = __LINE__;
+  server.send(200, "", "");
+  retained_state.enabled_ota = true;
 }
 
 void handleUpdate()
 {
-  
+  retained_state.program_counter = __LINE__;
   static char storedSSID[32];
   static char storedPassword[32];
   
@@ -576,16 +626,20 @@ void handleUpdate()
   wifiSetupState = DISCONNECT;
 
   server.send(200, "text/plain", "WiFi credentials updated. Please reconnect to the new WiFi.");
+  retained_state.program_counter = __LINE__;
 }
 
 void handleInfo()
 {
+  retained_state.program_counter = __LINE__;
   // Respond with the simulated light
   server.send(200, "text/plain", info_);
+  retained_state.program_counter = __LINE__;
 }
 
 // ISR definition with ICACHE_RAM_ATTR attribute
 void ICACHE_RAM_ATTR buttonInterrupt() {
+  retained_state.program_counter = __LINE__;
   // Read the state of the button
   buttonState = digitalRead(buttonPin);
 
@@ -605,6 +659,7 @@ void ICACHE_RAM_ATTR buttonInterrupt() {
   // Print the button state (HIGH or LOW)
   Serial.print("Button State: ");
   Serial.println(buttonState);
+  retained_state.program_counter = __LINE__;
 }
 
 
@@ -616,27 +671,30 @@ void ICACHE_RAM_ATTR buttonInterrupt() {
 #define TIMER_INTERVAL_101S           101000L
 
 void BeepHandler() {
-  if (global_state.beeps > 0) {
+  if (normal_state.beeps > 0) {
     if (digitalRead(buzzerPin) == LOW){
       digitalWrite(buzzerPin, HIGH);
     } else {
-      global_state.beeps--;
+      normal_state.beeps--;
       digitalWrite(buzzerPin, LOW);
     }
-    
   }
 }
 
 void IRAM_ATTR TimerHandler()
 {
-  if (global_state.handle_ota) {
+  retained_state.program_counter = __LINE__;
+  if (normal_state.handling_ota) {
+    retained_state.program_counter = __LINE__;
     return;
   }
-  if (global_state.beep_period > 0) {
-    global_state.beep_period--;
+  if (normal_state.beep_period > 0) {
+    retained_state.program_counter = __LINE__;
+    normal_state.beep_period--;
   } else {
+    retained_state.program_counter = __LINE__;
     BeepHandler();
-    global_state.beep_period = INTERVAL_BEEP;
+    normal_state.beep_period = INTERVAL_BEEP;
   }
   // Doing something here inside ISR
     // Toggle the LED state
@@ -654,11 +712,14 @@ void IRAM_ATTR TimerHandler()
     // updateInfoString(true);
   // }
 
-  if (global_state.alert) {
-    cricket_beep(global_state.current_state_start, 10000);
-  } else if (global_state.beeps == 0) {
+  if (normal_state.alert) {
+    retained_state.program_counter = __LINE__;
+    cricket_beep(normal_state.current_state_start, 10000);
+  } else if (normal_state.beeps == 0) {
+    retained_state.program_counter = __LINE__;
     digitalWrite(buzzerPin, LOW);
   }
+  retained_state.program_counter = __LINE__;
 }
 
 
@@ -698,7 +759,11 @@ void setup()
   Serial.println("Starting server...");
   server.on("/", HTTP_GET, handleRoot);
   server.on("/update", HTTP_POST, handleUpdate);
+  server.on("/clear_records", HTTP_POST, handleClearRecords);
   server.on("/reset", HTTP_POST, handleReset);
+  server.on("/restart", HTTP_POST, handleRestart);
+  server.on("/disable_ota", HTTP_POST, handleDisableOTA);
+  server.on("/enable_ota", HTTP_POST, handleEnableOTA);
   server.on("/info", HTTP_GET, handleInfo); // New route for info
   server.begin();
 
@@ -736,17 +801,24 @@ void setup()
     else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
     else if (error == OTA_END_ERROR) Serial.println("End Failed");
   });
-  ArduinoOTA.begin();
+  // tools.esptool.upload.network_pattern="{network_cmd}" -I "{runtime.platform.path}/tools/espota.py" -i "{serial.port}" -p "{network.port}" "--auth={network.password}" -f "{build.path}/{build.project_name}.bin"
+  // tools.esptool.upload.network_pattern="{network_cmd}" -I "{runtime.platform.path}/tools/espota.py" -i "192.168.1.30" -p "8266" "--auth={network.password}" -f "{build.path}/{build.project_name}.bin"
+  ArduinoOTA.begin(true);
 
-  global_state.beeps = 2;
+  normal_state.beeps = 3;
 
   Serial.println("We're alive") ;
   rst_info *rinfo;
   rinfo = ESP.getResetInfoPtr();
-  global_state.reset_reason = (int)rinfo->reason;
+  normal_state.reset_reason = (int)rinfo->reason;
   Serial.println(String("ResetInfo.reason = ") + (int)rinfo->reason);
 
-  global_state.program_counter_previous = program_counter;
+  if (retained_state.garbage_id != 0xF0F0F0F0) {
+    retained_state.garbage_id = 0xF0F0F0F0;
+    retained_state.program_counter = 0;
+    retained_state.enabled_ota = false;
+  }
+  normal_state.program_counter_previous = retained_state.program_counter;
 }
 
 // Some functions, that depend on hardware to stabilize, get setup after the first interval is ready
@@ -758,42 +830,42 @@ void late_setup() {
 }
 
 void updateSensorData() {
-  global_state.analogValue = analogRead(fotoresistorPin);
-  // global_state.light = constrain(map(analogValue, 1024, 0, 0, 100), 0, 100); // Map the analog value to a light range
-  global_state.light_on = digitalRead(lightFridgePin) == LOW;
-  global_state.door_contact_closed = digitalRead(doorFridgePin) == LOW;
+  normal_state.analogValue = analogRead(fotoresistorPin);
+  // normal_state.light = constrain(map(analogValue, 1024, 0, 0, 100), 0, 100); // Map the analog value to a light range
+  normal_state.light_on = digitalRead(lightFridgePin) == LOW;
+  normal_state.door_contact_closed = digitalRead(doorFridgePin) == LOW;
 
   flag:TempAndHumidity newValues = dht.getTempAndHumidity(); //Get the Temperature and humidity
   if (dht.getStatus() == 0) { //Judge if the correct value is read
-    global_state.temperature = newValues.temperature;
-    global_state.humidity = newValues.humidity;
-    if (!global_state.initialized_records) {
-      global_state.initialized_records = true;
-      global_state.min_temperature = global_state.temperature;
-      global_state.min_temperature_humidity = global_state.humidity;
-      global_state.max_temperature = global_state.temperature;
-      global_state.max_temperature_humidity = global_state.humidity;
-      global_state.min_humidity = global_state.humidity;
-      global_state.min_humidity_temperature = global_state.temperature;
-      global_state.max_humidity = global_state.humidity;
-      global_state.max_humidity_temperature = global_state.temperature;
+    normal_state.temperature = newValues.temperature;
+    normal_state.humidity = newValues.humidity;
+    if (!normal_state.initialized_records) {
+      normal_state.initialized_records = true;
+      normal_state.min_temperature = normal_state.temperature;
+      normal_state.min_temperature_humidity = normal_state.humidity;
+      normal_state.max_temperature = normal_state.temperature;
+      normal_state.max_temperature_humidity = normal_state.humidity;
+      normal_state.min_humidity = normal_state.humidity;
+      normal_state.min_humidity_temperature = normal_state.temperature;
+      normal_state.max_humidity = normal_state.humidity;
+      normal_state.max_humidity_temperature = normal_state.temperature;
     }
 
-    if (global_state.temperature < global_state.min_temperature) {
-      global_state.min_temperature = global_state.temperature;
-      global_state.min_temperature_humidity = global_state.humidity;
+    if (normal_state.temperature < normal_state.min_temperature) {
+      normal_state.min_temperature = normal_state.temperature;
+      normal_state.min_temperature_humidity = normal_state.humidity;
     }
-    if (global_state.temperature > global_state.max_temperature) {
-      global_state.max_temperature = global_state.temperature;
-      global_state.max_temperature_humidity = global_state.humidity;
+    if (normal_state.temperature > normal_state.max_temperature) {
+      normal_state.max_temperature = normal_state.temperature;
+      normal_state.max_temperature_humidity = normal_state.humidity;
     }
-    if (global_state.humidity < global_state.min_humidity) {
-      global_state.min_humidity = global_state.humidity;
-      global_state.min_humidity_temperature = global_state.temperature;
+    if (normal_state.humidity < normal_state.min_humidity) {
+      normal_state.min_humidity = normal_state.humidity;
+      normal_state.min_humidity_temperature = normal_state.temperature;
     }
-    if (global_state.humidity > global_state.max_humidity) {
-      global_state.max_humidity = global_state.humidity;
-      global_state.max_humidity_temperature = global_state.temperature;
+    if (normal_state.humidity > normal_state.max_humidity) {
+      normal_state.max_humidity = normal_state.humidity;
+      normal_state.max_humidity_temperature = normal_state.temperature;
     }
   }
 }
@@ -801,17 +873,17 @@ void updateSensorData() {
 void loop()
 {
   // Handle client requests
-  program_counter = __LINE__;
+  retained_state.program_counter = __LINE__;
   server.handleClient();
   
   // Handle client requests
-  program_counter = __LINE__;
+  retained_state.program_counter = __LINE__;
   serial_server.handleClient();
 
   // Blink the LED
   unsigned long currentMillis = millis();
 
-  if (currentMillis - previousMillis >= interval || currentMillis < previousMillis)
+  if ((currentMillis - previousMillis) >= interval || currentMillis < previousMillis)
   {
     // Save the last time we blinked the LED
     previousMillis = currentMillis;
@@ -820,9 +892,9 @@ void loop()
       late_setup();
     }
     
-    program_counter = __LINE__;
+    retained_state.program_counter = __LINE__;
     updateSensorData();
-    program_counter = __LINE__;
+    retained_state.program_counter = __LINE__;
     updateInfoString(true);
     // // Toggle the LED state
     // if (digitalRead(ledPin) == HIGH)
@@ -840,28 +912,35 @@ void loop()
     // }
   }
 
-  program_counter = __LINE__;
-  for (int direct_transitions; stateMachineFridge() && direct_transitions < 5; direct_transitions++){
-    direct_transitions++;
+  retained_state.program_counter = __LINE__;
+  for (int direct_transitions=0; stateMachineFridge() && direct_transitions < 5; direct_transitions++){
   }
 
-  program_counter = __LINE__;
-  for (int direct_transitions; stateMachineWiFi() && direct_transitions < 10; direct_transitions++){
-    direct_transitions++;
+  retained_state.program_counter = __LINE__;
+  for (int direct_transitions=0; stateMachineWiFi() && direct_transitions < 10; direct_transitions++){
   }
   
-  program_counter = __LINE__;
-  bool previous_ota = global_state.local_client;
+  retained_state.program_counter = __LINE__;
+  bool previous_ota = normal_state.local_client;
   IPAddress client_ip = server.client().remoteIP();
-  global_state.local_client = client_ip.isSet() && !client_ip.toString().startsWith("192.168.2");
-  if (!previous_ota && global_state.local_client) {
-    global_state.current_client_time = millis();
+
+  IPAddress softAPIP = WiFi.softAPIP();
+
+  bool client_via_AP = client_ip[0] == softAPIP[0] && client_ip[1] == softAPIP[1] && client_ip[2] == softAPIP[2];  
+
+  normal_state.local_client = client_ip.isSet() && !client_via_AP;
+  if (!previous_ota && normal_state.local_client) {
+    normal_state.current_client_time = millis();
   }
-  program_counter = __LINE__;
-  if (global_state.local_client || true) {
-    global_state.handle_ota = true;
+  retained_state.program_counter = __LINE__;
+  if ( retained_state.enabled_ota && allowed_ota() ) {
+    normal_state.handling_ota = true;
     ArduinoOTA.handle();
-    global_state.handle_ota = false;
+    normal_state.handling_ota = false;
   }
-  program_counter = __LINE__;
+  retained_state.program_counter = __LINE__;
+}
+
+bool allowed_ota(){
+  return normal_state.local_client || (get_viewer_time() > 3);
 }
